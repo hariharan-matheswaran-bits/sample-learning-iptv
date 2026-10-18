@@ -133,6 +133,7 @@ jobs:
           )
           PY
 
+
       - name: Commit merged playlist
         shell: bash
         run: |
@@ -144,7 +145,12 @@ jobs:
 
           if git diff --cached --quiet; then
             echo "No changes to the merged playlist."
-          else
-            git commit -m "Update combined IPTV playlist"
-            git push
+            exit 0
           fi
+
+          git commit -m "Update combined IPTV playlist"
+
+          git fetch origin main
+          git rebase origin/main
+
+          git push origin HEAD:main
