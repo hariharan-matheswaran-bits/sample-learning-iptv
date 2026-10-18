@@ -1,0 +1,84 @@
+
+name: Merge IPTV Playlists
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 0 * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  merge:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Merge playlists
+        run: |
+          python3 - <<'PY'
+          import urllib.request
+          from urllib.parse import urlsplit
+          from pathlib import Path
+
+          sources = [
+              "https://iptv-org.github.io/iptv/languages/tam.m3u",
+              "https://tinyurl.com/amaze-tamil-local-tv-withproxy",
+              "https://iptv-org.github.io/iptv/index.m3u",
+          ]
+
+          headers = {"User-Agent": "Mozilla/5.0"}
+          output = ["#EXTM3U"]
+          seen = set()
+          added = 0
+
+          for source in sources:
+              print(f"Fetching: {source}")
+              request = urllib.request.Request(
+                  source, headers=headers
+              )
+              with urllib.request.urlopen(
+                  request, timeout=90
+              ) as response:
+                  content = response.read().decode(
+                      "utf-8-sig", errors="replace"
+                  )
+
+              lines = content.splitlines()
+              pending = []
+
+              for line in lines:
+                  line = line.strip()
+                  if not line or line == "#EXTM3U":
+                      continue
+
+                  if line.startswith("#"):
+                      pending.append(line)
+                      continue
+
+                  if line not in seen:
+                      output.extend(pending)
+                      output.append(line)
+                      seen.add(line)
+                      added += 1
+
+                  pending = []
+
+          Path("combined.m3u").write_text(
+              "\n".join(output) + "\n", encoding="utf-8"
+          )
+          print(f"Saved {added} unique stream URLs.")
+          PY
+
+      - name: Commit merged playlist
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+          git add combined.m3u
+          git diff --cached --quiet || \
+            git commit -m "Update combined IPTV playlist"
+          git push
