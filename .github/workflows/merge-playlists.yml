@@ -18,67 +18,133 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Merge playlists
+        shell: bash
         run: |
           python3 - <<'PY'
           import urllib.request
-          from urllib.parse import urlsplit
           from pathlib import Path
+          from urllib.parse import urlsplit
 
           sources = [
               "https://iptv-org.github.io/iptv/languages/tam.m3u",
+              "https://tinyurl.com/Pocket-TV",
               "https://tinyurl.com/amaze-tamil-local-tv-withproxy",
-              "https://iptv-org.github.io/iptv/index.m3u",
+              "https://iptv-org.github.io/iptv/languages/eng.m3u",
+              "https://iptv-org.github.io/iptv/categories/movies.m3u",
+              "https://iptv-org.github.io/iptv/categories/series.m3u",
           ]
 
-          headers = {"User-Agent": "Mozilla/5.0"}
+          headers = {
+              "User-Agent": "Mozilla/5.0 IPTV-Playlist-Merger/1.0"
+          }
+
           output = ["#EXTM3U"]
-          seen = set()
-          added = 0
+          seen_urls = set()
+          total_added = 0
 
           for source in sources:
               print(f"Fetching: {source}")
+
               request = urllib.request.Request(
-                  source, headers=headers
+                  source,
+                  headers=headers
               )
+
               with urllib.request.urlopen(
-                  request, timeout=90
+                  request,
+                  timeout=120
               ) as response:
                   content = response.read().decode(
-                      "utf-8-sig", errors="replace"
+                      "utf-8-sig",
+                      errors="replace"
                   )
 
               lines = content.splitlines()
-              pending = []
 
-              for line in lines:
-                  line = line.strip()
-                  if not line or line == "#EXTM3U":
+              if not any(
+                  line.strip() == "#EXTM3U"
+                  for line in lines[:10]
+              ):
+                  raise ValueError(
+                      f"Invalid M3U playlist: {source}"
+                  )
+
+              pending_metadata = []
+              source_added = 0
+
+              for raw_line in lines:
+                  line = raw_line.strip()
+
+                  if not line:
+                      continue
+
+                  if line == "#EXTM3U":
                       continue
 
                   if line.startswith("#"):
-                      pending.append(line)
+                      pending_metadata.append(line)
                       continue
 
-                  if line not in seen:
-                      output.extend(pending)
-                      output.append(line)
-                      seen.add(line)
-                      added += 1
+                  parsed = urlsplit(line)
 
-                  pending = []
+                  if (
+                      parsed.scheme not in ("http", "https")
+                      or not parsed.netloc
+                  ):
+                      raise ValueError(
+                          f"Invalid stream URL in {source}: {line}"
+                      )
 
-          Path("combined.m3u").write_text(
-              "\n".join(output) + "\n", encoding="utf-8"
+                  if line in seen_urls:
+                      pending_metadata = []
+                      continue
+
+                  output.extend(pending_metadata)
+                  output.append(line)
+
+                  seen_urls.add(line)
+                  source_added += 1
+                  pending_metadata = []
+
+              if source_added == 0:
+                  raise ValueError(
+                      f"No new stream URLs found in {source}. "
+                      "The source may be unavailable or contain "
+                      "only duplicate URLs."
+                  )
+
+              total_added += source_added
+
+              print(
+                  f"Added {source_added} unique stream URLs "
+                  f"from this source."
+              )
+
+          playlist_path = Path("combined.m3u")
+
+          playlist_path.write_text(
+              "\n".join(output) + "\n",
+              encoding="utf-8"
           )
-          print(f"Saved {added} unique stream URLs.")
+
+          print(
+              f"Success! Created {playlist_path} with "
+              f"{total_added} unique stream URLs."
+          )
           PY
 
       - name: Commit merged playlist
+        shell: bash
         run: |
           git config user.name "github-actions[bot]"
           git config user.email \
             "41898282+github-actions[bot]@users.noreply.github.com"
+
           git add combined.m3u
-          git diff --cached --quiet || \
+
+          if git diff --cached --quiet; then
+            echo "No changes to the merged playlist."
+          else
             git commit -m "Update combined IPTV playlist"
-          git push
+            git push
+          fi
