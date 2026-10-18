@@ -9,6 +9,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: merge-iptv-playlists
+  cancel-in-progress: false
+
 jobs:
   merge:
     runs-on: ubuntu-latest
@@ -16,12 +20,16 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
 
       - name: Merge playlists
         shell: bash
         run: |
           python3 - <<'PY'
           import urllib.request
+          import urllib.error
           from pathlib import Path
           from urllib.parse import urlsplit
 
@@ -41,98 +49,117 @@ jobs:
           output = ["#EXTM3U"]
           seen_urls = set()
           total_added = 0
+          successful_sources = 0
+          failed_sources = []
 
           for source in sources:
-              print(f"Fetching: {source}")
+              print(f"\nFetching: {source}")
 
-              request = urllib.request.Request(
-                  source,
-                  headers=headers
-              )
-
-              with urllib.request.urlopen(
-                  request,
-                  timeout=120
-              ) as response:
-                  content = response.read().decode(
-                      "utf-8-sig",
-                      errors="replace"
+              try:
+                  request = urllib.request.Request(
+                      source, headers=headers
                   )
 
-              lines = content.splitlines()
-
-              if not any(
-                  line.strip() == "#EXTM3U"
-                  for line in lines[:10]
-              ):
-                  raise ValueError(
-                      f"Invalid M3U playlist: {source}"
-                  )
-
-              pending_metadata = []
-              source_added = 0
-
-              for raw_line in lines:
-                  line = raw_line.strip()
-
-                  if not line:
-                      continue
-
-                  if line == "#EXTM3U":
-                      continue
-
-                  if line.startswith("#"):
-                      pending_metadata.append(line)
-                      continue
-
-                  parsed = urlsplit(line)
-
-                  if (
-                      parsed.scheme not in ("http", "https")
-                      or not parsed.netloc
-                  ):
-                      raise ValueError(
-                          f"Invalid stream URL in {source}: {line}"
+                  with urllib.request.urlopen(
+                      request, timeout=120
+                  ) as response:
+                      content = response.read().decode(
+                          "utf-8-sig", errors="replace"
                       )
 
-                  if line in seen_urls:
-                      pending_metadata = []
+                  lines = content.splitlines()
+
+                  if not any(
+                      line.strip() == "#EXTM3U"
+                      for line in lines[:10]
+                  ):
+                      raise ValueError(
+                          "Response is not a valid M3U playlist"
+                      )
+
+                  # Parse into complete channel entries first.
+                  entries = []
+                  metadata = []
+
+                  for raw_line in lines:
+                      line = raw_line.strip()
+
+                      if not line or line == "#EXTM3U":
+                          continue
+
+                      if line.startswith("#"):
+                          metadata.append(line)
+                          continue
+
+                      parsed = urlsplit(line)
+
+                      if (
+                          parsed.scheme not in ("http", "https")
+                          or not parsed.netloc
+                      ):
+                          print(
+                              f"Skipping invalid stream URL: {line}"
+                          )
+                          metadata = []
+                          continue
+
+                      entries.append((metadata, line))
+                      metadata = []
+
+                  if not entries:
+                      raise ValueError(
+                          "Playlist contains no valid stream URLs"
+                      )
+
+                  source_added = 0
+
+                  for metadata, stream_url in entries:
+                      if stream_url in seen_urls:
+                          continue
+
+                      output.extend(metadata)
+                      output.append(stream_url)
+                      seen_urls.add(stream_url)
+                      source_added += 1
+
+                  if source_added == 0:
+                      print(
+                          "WARNING: No new streams; source may "
+                          "contain only duplicate URLs."
+                      )
                       continue
 
-                  output.extend(pending_metadata)
-                  output.append(line)
+                  successful_sources += 1
+                  total_added += source_added
 
-                  seen_urls.add(line)
-                  source_added += 1
-                  pending_metadata = []
-
-              if source_added == 0:
-                  raise ValueError(
-                      f"No new stream URLs found in {source}. "
-                      "The source may be unavailable or contain "
-                      "only duplicate URLs."
+                  print(
+                      f"Added {source_added} unique stream URLs."
                   )
 
-              total_added += source_added
+              except Exception as error:
+                  failed_sources.append((source, str(error)))
+                  print(f"WARNING: Skipping source: {error}")
 
-              print(
-                  f"Added {source_added} unique stream URLs "
-                  f"from this source."
+          if successful_sources == 0 or total_added == 0:
+              raise RuntimeError(
+                  "No usable playlists were merged. "
+                  "Existing combined.m3u will not be replaced."
               )
 
-          playlist_path = Path("combined.m3u")
-
-          playlist_path.write_text(
+          Path("combined.m3u").write_text(
               "\n".join(output) + "\n",
               encoding="utf-8"
           )
 
-          print(
-              f"Success! Created {playlist_path} with "
-              f"{total_added} unique stream URLs."
-          )
-          PY
+          print("\nMerge summary")
+          print(f"Successful sources: {successful_sources}/6")
+          print(f"Unique streams added: {total_added}")
 
+          if failed_sources:
+              print("Sources that need attention:")
+              for source, error in failed_sources:
+                  print(f" - {source}: {error}")
+          PY
 
       - name: Commit merged playlist
         shell: bash
@@ -144,13 +171,15 @@ jobs:
           git add combined.m3u
 
           if git diff --cached --quiet; then
-            echo "No changes to the merged playlist."
+            echo "No playlist changes."
             exit 0
           fi
 
           git commit -m "Update combined IPTV playlist"
 
-          git fetch origin main
-          git rebase origin/main
-
-          git push origin HEAD:main
+          # Retry once if main changed while the job was running.
+          if ! git push origin HEAD:main; then
+            echo "Push rejected; syncing with main and retrying."
+            git pull --rebase origin main
+            git push origin HEAD:main
+          fi
